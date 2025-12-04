@@ -11,15 +11,20 @@ class OriginalConfig:
         if not os.path.exists(self.results_dir):
             os.makedirs(self.results_dir)
 
-    # --- 原始系统专属参数 ---
+    # --- Original System (MIMO Hopf) Parameters ---
+    # From sindy-kmpc/config.py
     dt = 0.05
     sim_time = 20.0
+    
     n_states = 2
     n_inputs = 2  
     
-    # Koopman
-    poly_order = 2 
-    use_trig = False # 不需要三角函数
+    # Koopman / SINDy
+    poly_order = 3       # 关键: 该系统包含三次项 x^3
+    use_trig = False     # 不需要三角函数
+    threshold = 0.005
+    data_samples = 6000
+    lasso_alpha = 1e-5
     
     # MPC
     mpc_horizon = 15
@@ -28,8 +33,5 @@ class OriginalConfig:
     Rd_gain = 0.1
     Q_integral_gain = 10.0
     
-    # SINDy
-    threshold = 0.005
-    data_samples = 6000
-    lasso_alpha = 1e-5
+    # Data Collection
     collect_range = 1.5

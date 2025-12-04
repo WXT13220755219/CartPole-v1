@@ -6,37 +6,44 @@ from .config import OriginalConfig
 from .dynamics import OriginalSystem
 
 def run():
-    print("=== Running Original System (Stabilization Task) ===")
-    cfg = OriginalConfig(exp_note="stabilization")
+    print("=== Running Original System (MIMO Figure-8 Tracking) ===")
+    cfg = OriginalConfig(exp_note="MIMO_Tracking")
     env = OriginalSystem()
     kp_model = SindyKoopman(cfg)
 
     # ==========================================
-    # 1. 数据采集
+    # 1. 数据采集 (混合策略)
     # ==========================================
-    print("[Phase 1] Training...")
-    X, U, Xn = [], [], []
-    x = np.random.uniform(-cfg.collect_range, cfg.collect_range, size=(cfg.n_states,))
+    # 复现 sindy-kmpc/main.py 的数据采集逻辑，这对于训练好的 SINDy 模型至关重要
+    print("[Phase 1] Collecting training data & Training...")
+    X_train, U_train, X_next_train = [], [], []
+    x = np.array([0.1, 0.1])
     
     for i in range(cfg.data_samples):
-        u = np.random.uniform(-5, 5, size=(cfg.n_inputs,)) # 纯随机
-        xn = env.step(x, u, cfg.dt)
-        
-        if np.any(np.abs(xn) > 1e3):
-            x = np.random.uniform(-cfg.collect_range, cfg.collect_range, size=(cfg.n_states,))
-            continue
-            
-        X.append(x); U.append(u); Xn.append(xn)
-        
-        if i % 50 == 0:
-            x = np.random.uniform(-cfg.collect_range, cfg.collect_range, size=(cfg.n_states,))
+        # 30% 概率使用纯随机激励，70% 概率使用正弦/余弦激励以覆盖频域特性
+        if np.random.rand() > 0.7:
+            u = np.random.uniform(-3, 3, size=(cfg.n_inputs,))
         else:
-            x = xn
+            freq1, freq2 = 0.5 + np.random.rand(), 0.2 + np.random.rand()
+            u = np.array([
+                2.0 * np.sin(freq1 * i * cfg.dt) + np.random.normal(0, 0.1),
+                2.0 * np.cos(freq2 * i * cfg.dt) + np.random.normal(0, 0.1)
+            ])
             
-    kp_model.fit(np.array(X), np.array(U), np.array(Xn))
+        x_next = env.step(x, u, cfg.dt)
+        X_train.append(x); U_train.append(u); X_next_train.append(x_next)
+        
+        # 定期重置状态，防止发散过远
+        if i % 200 == 0: 
+            x = np.random.uniform(-1.5, 1.5, size=(cfg.n_states,))
+        else: 
+            x = x_next
+            
+    # 训练模型
+    kp_model.fit(np.array(X_train), np.array(U_train), np.array(X_next_train))
 
     # ==========================================
-    # [新增] 2. 可视化 Koopman 矩阵结构 (热力图)
+    # 2. 可视化 Koopman 矩阵结构
     # ==========================================
     print("[Phase 2] Visualizing Structure (Heatmap)...")
     feat_names = kp_model.get_feature_names()
@@ -50,51 +57,101 @@ def run():
     )
 
     # ==========================================
-    # 3. 闭环控制
+    # 3. 闭环控制 (Figure-8 轨迹跟踪)
     # ==========================================
-    print("[Phase 3] Control Evaluation...")
-    steps = int(cfg.sim_time / cfg.dt)
-    t_seq = np.arange(steps + cfg.mpc_horizon + 1) * cfg.dt
+    print("[Phase 3] Control Evaluation (Figure-8 Tracking)...")
     
-    # --- 构造零参考轨迹 ---
-    X_ref = np.zeros((len(t_seq), cfg.n_states))
-    Z_ref = kp_model.lift(X_ref)
+    # 生成参考轨迹 (8字形)
+    # 这里的 horizon + 1 是为了保证 MPC 在最后几步也有参考值
+    steps = int(cfg.sim_time / cfg.dt)
+    t_eval = np.arange(0, cfg.sim_time + cfg.dt * cfg.mpc_horizon, cfg.dt)
+    
+    # 使用 common/utils.py 中的函数生成轨迹
+    X_ref_full = utils.generate_figure_8_traj(t_eval, scale=1.5, omega=0.5)
+    
+    # 提升参考轨迹 (对于 Koopman MPC 是必须的)
+    Z_ref_full = kp_model.lift(X_ref_full) 
     
     # --- Koopman MPC ---
     mpc_k = KoopmanMPC(cfg, kp_model)
-    init_state = np.array([1.0, -0.5]) 
-    x_curr = init_state.copy()
+    x_curr = X_ref_full[0].copy() # 从参考轨迹起点开始
     u_prev = np.zeros(cfg.n_inputs)
     int_err = np.zeros(cfg.n_states)
+    
     log_x_k, log_u_k = [x_curr], []
-
+    
+    print("Running Koopman MPC loop...")
     for k in range(steps):
         z_curr = kp_model.lift(x_curr).flatten()
+        
+        # 获取 MPC 视界的参考片段
+        z_ref_h = Z_ref_full[k : k + cfg.mpc_horizon + 1]
+        x_ref_h = X_ref_full[k : k + cfg.mpc_horizon + 1]
+        
         try:
-            u_opt, int_err = mpc_k.get_control(z_curr, int_err, Z_ref[k:k+cfg.mpc_horizon+1], X_ref[k:k+cfg.mpc_horizon+1], u_prev)
+            u_opt, int_err = mpc_k.get_control(z_curr, int_err, z_ref_h, x_ref_h, u_prev)
         except Exception as e:
-            print(f"MPC Error: {e}"); break
+            print(f"MPC Error at step {k}: {e}")
+            u_opt = u_prev # 容错
             
-        x_curr = env.step(x_curr, u_opt, cfg.dt)
-        log_x_k.append(x_curr); log_u_k.append(u_opt)
+        x_next = env.step(x_curr, u_opt, cfg.dt)
+        log_x_k.append(x_next); log_u_k.append(u_opt)
+        
+        x_curr = x_next
         u_prev = u_opt
 
-    # --- Linear MPC ---
+    # --- Linear MPC (作为 Benchmark，复现 sindy-kmpc 的对比) ---
+    print("Running Linear MPC loop (Benchmark)...")
     mpc_l = LinearMPC(cfg, env)
-    x_curr = init_state.copy()
+    x_curr = X_ref_full[0].copy()
     u_prev = np.zeros(cfg.n_inputs)
     int_err = np.zeros(cfg.n_states)
+    
     log_x_l, log_u_l = [x_curr], []
-
+    
     for k in range(steps):
+        x_ref_h = X_ref_full[k : k + cfg.mpc_horizon + 1]
         try:
-            u_opt, int_err = mpc_l.get_control(x_curr, int_err, X_ref[k:k+cfg.mpc_horizon+1], u_prev)
-        except: break
-        x_curr = env.step(x_curr, u_opt, cfg.dt)
-        log_x_l.append(x_curr); log_u_l.append(u_opt)
+            u_opt, int_err = mpc_l.get_control(x_curr, int_err, x_ref_h, u_prev)
+        except:
+            u_opt = u_prev
+            
+        x_next = env.step(x_curr, u_opt, cfg.dt)
+        log_x_l.append(x_next); log_u_l.append(u_opt)
+        
+        x_curr = x_next
         u_prev = u_opt
 
-    # 绘图
-    t_plot = np.arange(0, cfg.sim_time + cfg.dt, cfg.dt)[:len(log_x_k)]
-    utils.plot_trajectory_and_control(t_plot, X_ref[:len(log_x_k)], np.array(log_u_k), np.array(log_x_k), np.array(log_u_l), np.array(log_x_l), cfg.results_dir)
-    print("Original System Done.")
+    # ==========================================
+    # 4. 绘图
+    # ==========================================
+    print("[Phase 4] Generating Plots...")
+    min_len = min(len(log_x_k), len(log_x_l))
+    u_len = min(len(log_u_k), len(log_u_l))
+    t_plot = np.arange(0, cfg.sim_time + cfg.dt, cfg.dt)[:min_len]
+    
+    # 轨迹与控制对比
+    utils.plot_trajectory_and_control(
+        t_plot, X_ref_full[:min_len],
+        np.array(log_u_k)[:u_len], np.array(log_x_k)[:min_len],
+        np.array(log_u_l)[:u_len], np.array(log_x_l)[:min_len], 
+        cfg.results_dir
+    )
+    
+    # 误差指标对比
+    utils.plot_error_and_metrics(
+        t_plot, X_ref_full[:min_len],
+        np.array(log_u_k)[:u_len], np.array(log_x_k)[:min_len],
+        np.array(log_u_l)[:u_len], np.array(log_x_l)[:min_len], 
+        cfg.results_dir
+    )
+    
+    # 相平面图 (Figure 8 效果图)
+    utils.plot_phase_plane_trajectory(
+        X_ref_full[:min_len],          
+        np.array(log_x_k)[:min_len],   
+        np.array(log_x_l)[:min_len],   
+        cfg.results_dir
+    )
+    
+    print(f"Original System Simulation Done. Results saved in {cfg.results_dir}")
