@@ -1,121 +1,82 @@
-import pybullet as pb
+import pybullet as p
 import pybullet_data
 import numpy as np
 import time
-import os
 
 class FrankaSystem:
-    def __init__(self, render=False):
+    def __init__(self, gui=False):
         # 初始化 PyBullet
-        if render:
-            self.client = pb.connect(pb.GUI)
-        else:
-            self.client = pb.connect(pb.DIRECT)
-            
-        pb.setAdditionalSearchPath(pybullet_data.getDataPath())
-        pb.loadURDF('plane.urdf')
+        self.client_id = p.connect(p.GUI if gui else p.DIRECT)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setGravity(0, 0, -9.81)
         
-        # 尝试加载 Franka Panda 模型
-        # 优先查找本地路径，如果没有则使用 PyBullet 自带的
-        local_urdf = "./franka/franka_description/robots/franka_panda.urdf"
-        if os.path.exists(local_urdf):
-            print(f"Loading local URDF: {local_urdf}")
-            self.robot = pb.loadURDF(local_urdf, [0.,0.,0.], useFixedBase=1)
-        else:
-            print("Local URDF not found, using PyBullet internal Panda model.")
-            self.robot = pb.loadURDF("franka_panda/panda.urdf", [0,0,0], useFixedBase=1)
-            
-        pb.setGravity(0, 0, -9.81)
+        # 加载地面和机器人
+        p.loadURDF("plane.urdf")
+        # 使用 PyBullet 自带的 panda 模型
+        # useFixedBase=True 保证基座固定
+        self.robot_id = p.loadURDF("franka_panda/panda.urdf", useFixedBase=True)
         
-        # 确定末端执行器 Link ID (通常是 11 或 7，取决于URDF)
-        # 这里我们简单遍历一下找到叫 'panda_hand' 或类似的 link，或者直接用索引
-        self.ee_id = 11 # PyBullet 自带 panda 的 EE 是 11
-        for i in range(pb.getNumJoints(self.robot)):
-            info = pb.getJointInfo(self.robot, i)
-            link_name = info[12].decode("utf-8")
-            if 'hand' in link_name or 'ee' in link_name:
-                self.ee_id = i
-                
-        self.u_max = 50.0
+        self.num_joints = 7
+        # PyBullet 中 Panda 的关节索引通常是 0-6 (对应 q1-q7)
+        # 但需注意 panda.urdf 可能包含指关节，这里我们只控制前7个轴
+        self.joint_indices = [0, 1, 2, 3, 4, 5, 6]
+        
+        # 启用力矩控制模式 (默认是位置控制，需要先关闭)
+        for j in self.joint_indices:
+            p.setJointMotorControl2(self.robot_id, j, controlMode=p.VELOCITY_CONTROL, force=0)
 
-    def reset_to_state(self, x):
-        """
-        强制将 PyBullet 物理引擎重置为向量 x 指定的状态
-        x: [EE_pos(3), Joint_pos(7), Joint_vel(7)]
-        注意：EE_pos 是由 Joint_pos 决定的，这里我们只重置关节
-        """
-        joint_pos = x[3:10]
-        joint_vel = x[10:17]
+    def reset(self, state=None):
+        """ 重置机器人状态 """
+        if state is None:
+            # 默认姿态 (Home)
+            q = [0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.7]
+            dq = [0.0] * 7
+        else:
+            q = state[:7]
+            dq = state[7:]
+            
+        for i, j_idx in enumerate(self.joint_indices):
+            p.resetJointState(self.robot_id, j_idx, targetValue=q[i], targetVelocity=dq[i])
         
-        index = 0
-        for i in range(pb.getNumJoints(self.robot)):
-            # 只有非固定关节才需要重置 (Franka有7个可控关节)
-            info = pb.getJointInfo(self.robot, i)
-            q_index = info[3]
-            if q_index > -1: # 是可动关节
-                if index < 7:
-                    pb.resetJointState(self.robot, i, joint_pos[index], joint_vel[index])
-                    index += 1
+        return self.get_state()
 
-    def get_obs(self):
-        """获取当前观测向量 (17维)"""
-        # 1. 获取关节状态
-        jnt_pos = []
-        jnt_vel = []
-        
-        for i in range(pb.getNumJoints(self.robot)):
-            info = pb.getJointInfo(self.robot, i)
-            if info[3] > -1 and len(jnt_pos) < 7: # 收集前7个关节
-                state = pb.getJointState(self.robot, i)
-                jnt_pos.append(state[0])
-                jnt_vel.append(state[1])
-        
-        # 2. 获取末端执行器状态 (EE Position)
-        ee_state = pb.getLinkState(self.robot, self.ee_id)
-        ee_pos = ee_state[0] # (x, y, z)
-        
-        # 拼接: EE(3) + Pos(7) + Vel(7) = 17 dims
-        return np.concatenate([ee_pos, jnt_pos, jnt_vel])
+    def get_state(self):
+        """ 获取当前 (q, dq) """
+        joint_states = p.getJointStates(self.robot_id, self.joint_indices)
+        # joint_states[i] = (pos, vel, reaction_forces, applied_torque)
+        q = [state[0] for state in joint_states]
+        dq = [state[1] for state in joint_states]
+        return np.array(q + dq)
 
     def step(self, x_current, u_current, dt):
+        """ 
+        执行一步仿真 
+        x_current: 当前状态 (仅用于校验，PyBullet内部维护状态)
+        u_current: 7维力矩输入
+        dt: 这里的 dt 主要用于记录，实际步长由 p.setTimeStep 决定
         """
-        执行一步仿真：
-        SINDy-MPC 需要形如 x_next = f(x, u) 的函数。
-        """
-        # 1. 强制设置当前状态 (确保无状态函数的假设成立)
-        self.reset_to_state(x_current)
+        # 1. 设置仿真步长 (保持与 config 一致)
+        p.setTimeStep(dt)
         
-        # 2. 应用控制 (力矩控制)
-        u = np.clip(u_current, -self.u_max, self.u_max)
+        # 2. 应用力矩控制
+        # 注意：PyBullet 的 setJointMotorControl2 在 TORQUE_CONTROL 模式下
+        # force 参数即为力矩
+        for i, j_idx in enumerate(self.joint_indices):
+            torque = np.clip(u_current[i], -87, 87) # 简单的限幅保护
+            p.setJointMotorControl2(self.robot_id, j_idx, 
+                                    controlMode=p.TORQUE_CONTROL, 
+                                    force=torque)
         
-        # 找到那7个可控关节的索引
-        control_indices = []
-        for i in range(pb.getNumJoints(self.robot)):
-            info = pb.getJointInfo(self.robot, i)
-            if info[3] > -1 and len(control_indices) < 7:
-                control_indices.append(i)
-
-        pb.setJointMotorControlArray(
-            self.robot, control_indices,
-            pb.TORQUE_CONTROL, forces=u
-        )
+        # 3. 物理引擎步进
+        p.stepSimulation()
         
-        # 3. 步进仿真
-        # PyBullet 默认 timestep 通常是 1/240
-        sim_step = 1./240.
-        num_steps = int(dt / sim_step)
-        if num_steps < 1: num_steps = 1
-        
-        for _ in range(num_steps):
-            pb.stepSimulation()
-            
         # 4. 返回新状态
-        return self.get_obs()
-    
-    def close(self):
-        pb.disconnect()
+        return self.get_state()
 
     def get_jacobian(self, x, u):
-        # 机械臂的解析线性化极其复杂，这里不提供 LinearMPC 支持
-        # SINDy-KMPC 不需要这个函数
+        # 占位符：SINDy-KMPC 不需要物理模型的 Jacobian
+        # 如果需要 LinearMPC，这里需要用数值差分法求 A, B
         return None, None
+
+    def close(self):
+        p.disconnect(self.client_id)

@@ -10,10 +10,10 @@ def main():
     print("Select System to Run:")
     print("1. Original (Benchmark System with Stabilization)")
     print("2. Pendulum (Inverted Pendulum with Sine Tracking)")
-    print("3. Franka Panda (7-DOF Arm with SINDy-KMPC)")
+    print("3. Franka (7-DOF Robot Arm with PyBullet)")
     
     # 简单的交互选择，或者你可以直接注释掉不用的
-    choice = input("Enter 1 or 2: ")
+    choice = input("Enter 1, 2 or 3: ")
     
     if choice == '1':
         original_runner.run()

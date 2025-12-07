@@ -14,7 +14,7 @@ class PendulumConfig:
     # --- 倒立摆专属参数 ---
     dt = 0.05
     sim_time = 10.0
-    n_states = 2     # [theta, theta_dot]
+    n_states = 2     # [theta, theta_dot]角度、角速度
     n_inputs = 1     # Torque
     
     # Koopman
